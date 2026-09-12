@@ -1,0 +1,570 @@
+// tioattrs.nv — the terminal's attributes as a value, and the restore
+// that cannot be forgotten.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE BUG THIS PACKAGE EXISTS TO MAKE UNWRITEABLE is a program that
+// enters raw mode and exits without leaving it.  The user's shell is
+// then a shell with no echo and no line editing, and the only way back
+// is `reset` typed blind.  Every terminal program in existence has
+// shipped that bug at least once, and it is never a bug in the code
+// that enters raw mode — it is a bug in a path out of the program that
+// nobody thought about while writing the path in.
+//
+// SO THE ENTRY OWNS THE EXIT.  `with_raw` takes the loop as an
+// argument and puts the terminal back before it answers, on every path
+// the loop can leave by.  A caller writes no restore at all, so there
+// is no restore to forget.
+//
+// THE EXPLICIT PAIR IS STILL HERE, because a multiplexer's pump owns
+// the process and cannot be handed to anything.  `enter_raw` answers a
+// `TioRestore` — a value carrying the attributes that were in force
+// and the descriptor they belong to — and `restore` takes it.  The
+// token is the difference between "call restore" (a rule in a README)
+// and "you are holding the thing restore needs" (a value in a
+// variable).
+//
+// THE ATTRIBUTES ARE READ ONCE AND WRITTEN BACK VERBATIM.  Twelve
+// flags are named here because a program reasons about them by name;
+// every other bit of the platform's structure — the baud rates, the
+// control characters this package does not touch, the fields a kernel
+// added last year — rides in `opaque` and goes back exactly as it
+// came.  A package that rebuilt the structure from the flags it knew
+// about would silently drop the ones it did not, and the user whose
+// terminal had a non-default VERASE would find it changed.
+//
+// WHAT `with_raw` CANNOT COVER, stated rather than implied: a signal
+// that ends the process without unwinding.  SIGKILL is nobody's to
+// catch.  SIGTERM and SIGINT are, and the answer is the same shape as
+// the one `tiosize` uses for SIGWINCH — the standard library's
+// `process.shutdown_requested()` is a poll, so the loop asks it each
+// tick and returns, and returning is what runs the restore.
+
+// A file descriptor that is known to be a terminal.
+//
+// A type rather than an `Int` for one reason: every function in this
+// package would otherwise take an `Int` that might be a socket, a
+// pipe or a closed slot, and `tcsetattr` on any of those is a silent
+// no-op on some platforms and an error on others.  `terminal` is the
+// only way to make one, and it asks the kernel.
+pub struct TioFd
+    fd: Int
+
+// The termios flags a program reasons about by name.
+//
+// Twelve, and the twelve are not arbitrary: they are the ones raw mode
+// changes and the ones a program turns back on one at a time when full
+// raw is too much.  Everything else lives in `TioAttrs.opaque`.
+pub struct TioFlags
+    // ECHO — the kernel writes each byte back as it arrives.  Off in
+    // raw mode, and the reason a password prompt turns it off on its
+    // own.
+    echo: Bool
+    // ICANON — the kernel buffers a line and answers the read only at
+    // the newline, applying erase and kill characters on the way.  Off
+    // in raw mode; off and nothing else is what "cbreak" means.
+    canonical: Bool
+    // ISIG — INTR, QUIT and SUSP become signals rather than bytes.
+    // The one flag a raw-mode program most often wants back on: an
+    // editor hosting a child process wants Ctrl-C to reach the child.
+    signals: Bool
+    // IEXTEN — the extended input processing that makes Ctrl-V quote
+    // the next character and Ctrl-O discard output.
+    extended: Bool
+    // IXON — Ctrl-S stops output and Ctrl-Q resumes it.  A full-screen
+    // program that leaves this on has a Ctrl-S its user cannot bind
+    // and a terminal that appears to have frozen.
+    flow_control: Bool
+    // ICRNL — a carriage return arrives as a newline.  With it on, the
+    // Enter key and Ctrl-J are indistinguishable.
+    cr_to_nl: Bool
+    // OPOST — the kernel post-processes output, which in practice
+    // means a lone LF becomes CR LF.  Off in raw mode, which is why a
+    // raw-mode program must write its own carriage returns.
+    output_processing: Bool
+    // BRKINT — a break condition raises SIGINT.
+    break_interrupt: Bool
+    // ISTRIP — the eighth bit of every input byte is cleared, which
+    // turns UTF-8 into rubbish.
+    strip_high_bit: Bool
+    // INPCK — input parity checking.
+    parity_check: Bool
+    // VMIN — the fewest bytes a read will answer with.  1 is the
+    // single-byte pump; 0 with a VTIME is a read with a deadline.
+    min_bytes: Int
+    // VTIME — the read's deadline in tenths of a second, or 0 for no
+    // deadline.  The kernel's own escape-sequence timer, and the
+    // reason `tioinput` offers a second one: a tenth of a second is
+    // four times longer than a lone ESC should wait.
+    timeout_deciseconds: Int
+
+// The whole of a terminal's attributes: the named flags, and every
+// other byte of the platform's structure carried through unread.
+//
+// `opaque` is not an escape hatch, it is the correctness condition.
+// Writing back a structure assembled from twelve booleans would reset
+// the baud rate, VERASE, VKILL and whatever else the user or their
+// login shell had set — changes this package never made and has no
+// business making.
+pub struct TioAttrs
+    flags: TioFlags
+    // The platform's `struct termios` exactly as it was read.
+    // Applying a `TioAttrs` writes these bytes back with only the
+    // named flags overlaid.
+    opaque: [u8]
+
+// The token `restore` needs: the attributes that were in force, and
+// the descriptor to put them back on.
+//
+// Answered by `enter_raw` and consumed by `restore`.  A caller holding
+// one is a caller who has changed the terminal and has not yet put it
+// back, which is a fact that reads off the variable rather than off a
+// comment.
+pub struct TioRestore
+    fd: TioFd
+    saved: TioAttrs
+    // False once `restore` has been called with this token, so a
+    // double restore is a no-op rather than a second write of stale
+    // attributes over a terminal a later caller has since configured.
+    pending: Bool
+
+// How much of the terminal raw mode takes away.
+//
+// Three settings, because the three are genuinely different programs.
+pub enum TioRawMode
+    // Everything off: no echo, no line buffering, no signals, no flow
+    // control, no output post-processing.  `cfmakeraw`.  What a
+    // terminal emulator and a multiplexer want, because every byte
+    // including Ctrl-C belongs to the child on the other side.
+    TioRawFull
+    // `TioRawFull` with ISIG left on, so Ctrl-C still raises SIGINT.
+    // What an editor that hosts a child process wants, and what a
+    // long-running full-screen tool wants so its user can always get
+    // out.
+    TioRawKeepSignals
+    // Canonical mode and echo off, everything else left alone.  What a
+    // menu, a pager or a single-key prompt wants: keys arrive one at a
+    // time and the terminal is otherwise the terminal the user had.
+    TioCbreak
+
+// When a `tcsetattr` takes effect.
+pub enum TioWhen
+    // TCSANOW — immediately, with whatever is queued left queued.
+    TioNow
+    // TCSADRAIN — after everything already written has been sent.  The
+    // right choice when the change affects output.
+    TioDrain
+    // TCSAFLUSH — after output drains, and pending input is discarded.
+    // The right choice on the way INTO raw mode, because the bytes
+    // typed while the program was starting were typed at a different
+    // terminal mode than the one about to read them.
+    TioFlush
+
+// What can go wrong, and it is a short list because this package does
+// a short list of things.
+pub enum TioError
+    // The descriptor is not a terminal: a pipe, a file, `/dev/null`,
+    // or a closed slot.  The single most common one in practice, and
+    // it is CI.
+    TioNotATerminal(fd: Int)
+    // `tcgetattr` refused.
+    TioAttrsUnreadable(errno: Int)
+    // `tcsetattr` refused.  The terminal is now in an unknown state and
+    // the caller still holds the `TioRestore` that would fix it.
+    TioAttrsUnwritable(errno: Int)
+    // This process has no controlling terminal — a daemon, a cron job,
+    // a container with no tty allocated.  Distinct from
+    // `TioNotATerminal`, which is about one descriptor.
+    TioNoControllingTerminal
+    // The size ioctl refused, and no fallback answered either.
+    TioSizeUnavailable(errno: Int)
+    // A write to the terminal failed part way.  `written` is how many
+    // bytes went, because a half-written escape sequence is a terminal
+    // in a state the caller has to reason about.
+    TioWriteFailed(errno: Int, written: Int)
+    // A read from the terminal failed.
+    TioReadFailed(errno: Int)
+    // The escape sequence held by the input decoder outgrew its limit;
+    // the bytes were dropped.
+    TioSequenceTooLong(bytes: Int)
+
+// The one-line reading of a failure, for a log or a person.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     let e: TioError = TioNotATerminal(0)
+//     println(e.message())
+// ```
+impl Error for TioError
+    fn message(self) -> Str
+        todo("termios-nv.tioattrs.message")
+
+// ── Getting hold of a terminal ─────────────────────────────────────
+
+// Whether a descriptor is a terminal.
+//
+// The probe every terminal program starts with, and the one that keeps
+// the rest of the package honest in CI: a test harness with a piped
+// stdin gets `false` here and takes the no-terminal path, rather than
+// getting an error out of `tcgetattr` three calls later.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     if tioattrs.is_terminal(0)
+//         println("interactive")
+//     else
+//         println("piped")
+// ```
+pub fn is_terminal(fd: Int) -> Bool [io]
+    todo("termios-nv.tioattrs.is_terminal")
+
+// A `TioFd` for a descriptor, or `TioNotATerminal`.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.terminal(0)
+//         Ok(_)  => println("stdin is a terminal")
+//         Err(_) => println("stdin is not")
+// ```
+pub fn terminal(fd: Int) -> Result<TioFd, TioError> [io]
+    todo("termios-nv.tioattrs.terminal")
+
+// The process's stdin, if it is a terminal.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Ok(_)  => println("raw mode is available")
+//         Err(_) => println("no terminal on stdin")
+// ```
+pub fn stdin_terminal() -> Result<TioFd, TioError> [io]
+    todo("termios-nv.tioattrs.stdin_terminal")
+
+// `/dev/tty` — the process's controlling terminal, whatever its
+// standard descriptors have been redirected to.
+//
+// The difference matters and it is not a corner case: `novim file |
+// grep x` has a pipe on stdout and a program that took the size and
+// the raw mode from stdout would find neither.  A full-screen program
+// run inside a shell pipeline still has a user in front of a terminal,
+// and this is how it reaches them.  Answers
+// `TioNoControllingTerminal` for a daemon, which has none.
+//
+// The descriptor is this package's to close; `close` is how.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.controlling_terminal()
+//         Ok(t)  => tioattrs.close(t)
+//         Err(_) => println("no controlling terminal")
+// ```
+pub fn controlling_terminal() -> Result<TioFd, TioError> [io]
+    todo("termios-nv.tioattrs.controlling_terminal")
+
+// Close a descriptor this package opened.
+//
+// Only for one from `controlling_terminal`.  Closing a `TioFd` made
+// from 0, 1 or 2 closes the process's own standard descriptor, which
+// is why `terminal` does not hand ownership over and this function
+// does not check.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.controlling_terminal()
+//         Ok(t)  => tioattrs.close(t)
+//         Err(_) => println("no controlling terminal")
+// ```
+pub fn close(t: TioFd) [io]
+    todo("termios-nv.tioattrs.close")
+
+// The raw descriptor number, for a caller passing it to a poll or a
+// read this package does not wrap.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Ok(t)  => println("${tioattrs.fd_of(t)}")
+//         Err(_) => println("not a terminal")
+// ```
+pub fn fd_of(t: TioFd) -> Int []
+    todo("termios-nv.tioattrs.fd_of")
+
+// ── The attributes, read and written ───────────────────────────────
+
+// Read the terminal's attributes.
+//
+// The `[io]` half of the package's whole job.  Called once, at the
+// start, and the value it answers is what `restore` writes back at the
+// end.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Err(_) => println("not a terminal")
+//         Ok(t)  =>
+//             match tioattrs.attrs_of(t)
+//                 Ok(_)  => println("read the attributes")
+//                 Err(_) => println("could not read them")
+// ```
+pub fn attrs_of(t: TioFd) -> Result<TioAttrs, TioError> [io]
+    todo("termios-nv.tioattrs.attrs_of")
+
+// Write attributes back.
+//
+// `when` is not a detail.  `TioFlush` on the way in discards the bytes
+// typed before the mode changed — otherwise a key pressed during
+// startup is delivered under rules it was not typed under.  `TioDrain`
+// on the way out lets the program's last frame finish before output
+// post-processing comes back.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Err(_) => println("not a terminal")
+//         Ok(t)  =>
+//             match tioattrs.attrs_of(t)
+//                 Err(_) => println("could not read the attributes")
+//                 Ok(a)  =>
+//                     match tioattrs.set_attrs(t, a, TioNow)
+//                         Some(_) => println("refused")
+//                         None    => println("written")
+// ```
+pub fn set_attrs(t: TioFd, a: TioAttrs, when: TioWhen) -> ?TioError [io]
+    todo("termios-nv.tioattrs.set_attrs")
+
+// The flag arithmetic, with no terminal in it.
+//
+// `[]`, and deliberately so: what "raw" means is a transformation from
+// one attribute value to another, and a test that wants to assert it
+// should not need a pty to do so.  Everything `enter_raw` does beyond
+// this is one read and one write.
+//
+// ```novo
+// use tioattrs
+//
+// fn strip(a: TioAttrs) -> TioAttrs
+//     tioattrs.raw_attrs(a, TioRawFull)
+// ```
+pub fn raw_attrs(a: TioAttrs, mode: TioRawMode) -> TioAttrs []
+    todo("termios-nv.tioattrs.raw_attrs")
+
+// The named flags of an attribute value.
+//
+// ```novo
+// use tioattrs
+//
+// fn echoes(a: TioAttrs) -> Bool
+//     tioattrs.flags_of(a).echo
+// ```
+pub fn flags_of(a: TioAttrs) -> TioFlags []
+    todo("termios-nv.tioattrs.flags_of")
+
+// The same attributes with different named flags, and every opaque
+// byte untouched.
+//
+// The escape hatch for the program whose mode is nearly one of the
+// three: raw with echo back on for a `read -s`-shaped prompt, cbreak
+// with flow control off so Ctrl-S is bindable.
+//
+// ```novo
+// use tioattrs
+//
+// fn reflag(a: TioAttrs, f: TioFlags) -> TioAttrs
+//     tioattrs.with_flags(a, f)
+// ```
+pub fn with_flags(a: TioAttrs, f: TioFlags) -> TioAttrs []
+    todo("termios-nv.tioattrs.with_flags")
+
+// Whether two attribute values would set the terminal identically —
+// the named flags and the opaque bytes both.
+//
+// What a test asserts on, and what a program uses to skip a
+// `tcsetattr` that would change nothing.
+//
+// ```novo
+// use tioattrs
+//
+// fn unchanged(a: TioAttrs, b: TioAttrs) -> Bool
+//     tioattrs.attrs_eq(a, b)
+// ```
+pub fn attrs_eq(a: TioAttrs, b: TioAttrs) -> Bool []
+    todo("termios-nv.tioattrs.attrs_eq")
+
+// ── Raw mode, both shapes ──────────────────────────────────────────
+
+// Enter raw mode and answer the token that undoes it.
+//
+// One read and one write: the attributes come back, `raw_attrs`
+// transforms them, `set_attrs` with `TioFlush` applies them, and the
+// value read is what the token carries.
+//
+// Idempotent is NOT the contract here, and that is deliberate.  A
+// second `enter_raw` answers a second token carrying the ALREADY-RAW
+// attributes, and restoring that one leaves the terminal raw.  A
+// program that needs to enter twice is a program with two owners of
+// one terminal, and the fix is one owner, not a package that hides the
+// second.
+//
+// ```novo
+// use tioattrs
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Err(_) => println("not a terminal")
+//         Ok(t)  =>
+//             match tioattrs.enter_raw(t, TioRawFull)
+//                 Err(_) => println("could not enter raw mode")
+//                 Ok(r)  =>
+//                     let _ = tioattrs.restore(r)
+//                     println("restored")
+// ```
+pub fn enter_raw(t: TioFd, mode: TioRawMode) -> Result<TioRestore, TioError> [io]
+    todo("termios-nv.tioattrs.enter_raw")
+
+// Put the terminal back the way it was.
+//
+// Writes the saved attributes with `TioDrain`, so the program's last
+// output is flushed under the mode it was written for.  A second call
+// with the same token does nothing: the token is spent, and writing
+// stale attributes over a terminal somebody else has since configured
+// is worse than doing nothing.
+//
+// ```novo
+// use tioattrs
+//
+// fn put_back(r: TioRestore) -> ?TioError [io]
+//     tioattrs.restore(r)
+// ```
+pub fn restore(r: TioRestore) -> ?TioError [io]
+    todo("termios-nv.tioattrs.restore")
+
+// Whether this token still owes the terminal a restore.
+//
+// ```novo
+// use tioattrs
+//
+// fn owes(r: TioRestore) -> Bool
+//     tioattrs.restore_is_pending(r)
+// ```
+pub fn restore_is_pending(r: TioRestore) -> Bool []
+    todo("termios-nv.tioattrs.restore_is_pending")
+
+// The attributes a token would write back, for a caller that wants to
+// inspect them without spending it.
+//
+// ```novo
+// use tioattrs
+//
+// fn was_canonical(r: TioRestore) -> Bool
+//     tioattrs.flags_of(tioattrs.saved_attrs(r)).canonical
+// ```
+pub fn saved_attrs(r: TioRestore) -> TioAttrs []
+    todo("termios-nv.tioattrs.saved_attrs")
+
+// Run `body` in raw mode and put the terminal back before answering.
+//
+// **This is the shape to reach for.**  There is no restore in the
+// caller's code, so there is no restore for the caller to forget, and
+// no early return out of `body` can skip it.  `body` answers the
+// process's exit status, which is what a terminal program's main loop
+// has to answer anyway.
+//
+// `body` is a NAMED function rather than a lambda, and the reason is
+// worth a line: a named function is one a test can call directly with
+// no terminal, which is the difference between a loop that is tested
+// and a loop that is only ever run.
+//
+// What this cannot cover is a signal that ends the process without
+// unwinding.  The standard library's `process.shutdown_requested()`
+// is a poll of exactly the shape `tiosize.size_changed` uses, so the
+// body asks it each tick and returns; returning is what runs the
+// restore.
+//
+// ```novo
+// use tioattrs
+//
+// fn read_one_key(t: TioFd) -> Int [io]
+//     0
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Err(_) => println("not a terminal")
+//         Ok(t)  =>
+//             match tioattrs.with_raw(t, TioRawFull, read_one_key)
+//                 Ok(code) => println("${code}")
+//                 Err(_)   => println("could not take the terminal")
+// ```
+pub fn with_raw(t: TioFd, mode: TioRawMode,
+                body: fn(TioFd) -> Int [io]) -> Result<Int, TioError> [io]
+    todo("termios-nv.tioattrs.with_raw")
+
+// ── Writing to the terminal ────────────────────────────────────────
+
+// Write bytes to the terminal.
+//
+// The only write in the package, and every escape sequence this
+// package sends goes through it.  `tioscreen` builds the bytes with
+// ansi-nv and hands them here; a caller that wants a sequence this
+// package does not model builds it with ansi-nv and hands it here
+// too.
+//
+// A short write is an error and not a silent success: a half-written
+// `CSI ? 1049 h` leaves the terminal in a state the caller has to know
+// about, so `TioWriteFailed` carries how many bytes went.
+//
+// ```novo
+// use seqwrite
+// use tioattrs
+//
+// fn clear(t: TioFd) -> Result<Int, TioError> [io]
+//     tioattrs.write_bytes(t, seqwrite.erase_display([], AnsiEraseAll))
+// ```
+pub fn write_bytes(t: TioFd, data: [u8]) -> Result<Int, TioError> [io]
+    todo("termios-nv.tioattrs.write_bytes")
+
+// Wait until the terminal has actually sent everything written.
+//
+// `tcdrain`.  What a program calls before it restores, and what a
+// program calls before it hands the descriptor to a child.
+//
+// ```novo
+// use tioattrs
+//
+// fn settle(t: TioFd) -> ?TioError [io]
+//     tioattrs.drain(t)
+// ```
+pub fn drain(t: TioFd) -> ?TioError [io]
+    todo("termios-nv.tioattrs.drain")
+
+// Discard input the terminal has buffered but the program has not read.
+//
+// `tcflush` on the input queue.  What a program calls after a long
+// blocking operation, so the keys mashed while it was busy do not
+// arrive all at once as commands.
+//
+// ```novo
+// use tioattrs
+//
+// fn forget_typeahead(t: TioFd) -> ?TioError [io]
+//     tioattrs.flush_input(t)
+// ```
+pub fn flush_input(t: TioFd) -> ?TioError [io]
+    todo("termios-nv.tioattrs.flush_input")

@@ -1,0 +1,58 @@
+[package]
+name        = "termios-nv"
+version     = "0.0.1"
+description = "Raw mode and the restore discipline: the terminal's attributes read once as a value and written back, a raw-mode entry the caller cannot forget to undo, the window size by ioctl and by escape-sequence query with SIGWINCH polled rather than handled, the alternate screen and the mouse, bracketed-paste and cursor toggles as one screen state that restores exactly what it set, and the read loop that turns raw bytes into keymap-nv key events with the lone-ESC timeout as a value.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and `[io]` is the whole of it — no clock, no filesystem, no
+# process.  A terminal is the one place a library is most tempted to
+# print, and this is one of the packages whose purpose IS the terminal,
+# so the `[io]` row is the disclosure rather than the violation
+# (`docs/publishing.md` § Design).
+#
+# HALF THE PACKAGE STILL DECLARES NOTHING.  `raw_attrs` is the flag
+# arithmetic, `screen_bytes` is the escape sequence, `feed_bytes` is
+# the decoder — every one of them `[]`, and every one of them testable
+# with no terminal anywhere near the test.  What performs is the
+# ioctl, the tcsetattr, the poll and the read.
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`: the
+# subject of this package is a file descriptor that is a terminal.
+# The pure halves are here because the effectful ones need them, not
+# the other way round.
+layer       = "host"
+
+category    = "terminal"
+
+tags        = ["termios", "raw-mode", "tty", "terminal", "sigwinch", "winsize", "alternate-screen", "bracketed-paste", "mouse-reporting"]
+repository  = "https://github.com/novolang/termios-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Raw mode, and putting the terminal back"
+
+[dependencies]
+# The escape sequences this package writes and the replies it reads.
+# `core`, so `dep-layer` holds, and the split is the point: ansi-nv
+# BUILDS `CSI ? 1049 h` into a caller's buffer and knows nothing about
+# a file descriptor; this package owns the descriptor and writes it.
+# Nothing here re-spells a sequence ansi-nv already spells.
+ansi-nv = "^0.0.1"
+
+# The key and mouse decoder.  `core`, and its one deliberate hole is
+# the hole this package fills: a lone ESC is either the Escape key or
+# the first byte of a sequence, and only the party whose READ TIMED
+# OUT can tell.  keymap-nv holds the bytes and reports `pending`; the
+# reader in `tioinput` is the party with the timeout.
+keymap-nv = "^0.0.1"

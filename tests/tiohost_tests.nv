@@ -1,0 +1,268 @@
+// tiohost_tests.nv — the half of the package that touches a
+// descriptor, exercised where there is no terminal.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: termios-nv.<module>.<fn>`.
+//
+// THIS IS NOT A SECOND-CLASS TEST FILE.  "There is no terminal here"
+// is the condition every one of these functions meets most often — in
+// CI, in a pipeline, under a build system, inside a container with no
+// tty — and a package whose `[io]` half only behaved on a developer's
+// laptop would be a package that breaks in exactly the place nobody
+// watches.  So the assertion is that each of them REFUSES with a
+// reason rather than hanging, guessing, or changing something.
+
+use keydecode
+use std.list
+use std.test
+use tioattrs
+use tioinput
+use tioscreen
+use tiosize
+
+// A body for `with_raw` and `with_screen`.  A named function rather
+// than a lambda, which is the shape those two take — and the reason
+// they take it is visible right here: this loop is callable from a
+// test with no terminal behind it.
+fn park(t: TioFd) -> Int [io]
+    let _ = tioattrs.fd_of(t)
+    0
+
+@test
+fn test_a_redirected_stdin_is_not_a_terminal() [io]
+    // The probe every terminal program starts with.  Under `novo test`
+    // stdin is not a tty, and answering `false` here is what lets the
+    // rest of the package refuse cleanly instead of failing at a
+    // `tcgetattr` three calls later.
+    test.case("the probe answers without raising")
+    let _ = tioattrs.is_terminal(0)
+
+@test
+fn test_the_controlling_terminal_is_opened_and_closed_by_this_package() [io]
+    // `/dev/tty` rather than stdin, because `novim file | grep x` has a
+    // pipe on its standard descriptors and a user in front of a
+    // terminal all the same.  A daemon has neither, and gets
+    // `TioNoControllingTerminal`.
+    match tioattrs.controlling_terminal()
+        Err(_) => test.case("no controlling terminal — the daemon's answer")
+        Ok(t)  =>
+            test.case("the descriptor is this package's to close")
+            let _ = tioattrs.fd_of(t)
+            tioattrs.close(t)
+
+@test
+fn test_reading_attributes_off_a_pipe_is_refused_rather_than_guessed() [io]
+    // There is no sensible default `struct termios` and this package
+    // does not invent one: a program that got a made-up value would
+    // write a made-up value back.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("not a terminal — nothing to read")
+        Ok(t)  =>
+            match tioattrs.attrs_of(t)
+                Err(_) => test.assert(false)
+                Ok(a)  =>
+                    test.case("and what was read can be written straight back")
+                    test.assert_none(tioattrs.set_attrs(t, a, TioNow))
+
+@test
+fn test_with_raw_answers_the_bodys_status_or_says_why_it_could_not_run() [io]
+    // The shape to reach for, and its contract in one assertion: the
+    // caller writes no restore, so there is none to forget, and the
+    // answer is what the body answered.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — the body never runs")
+        Ok(t)  =>
+            match tioattrs.with_raw(t, TioRawKeepSignals, park)
+                Err(_)   => test.assert(false)
+                Ok(code) =>
+                    test.case("the body's status came back")
+                    test.assert(code == 0)
+
+@test
+fn test_writing_to_a_terminal_reports_how_far_it_got() [io]
+    // A short write is an error and not a silent success: half an
+    // escape sequence leaves the terminal in a state the caller has to
+    // reason about, so the count travels with the failure.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — nothing to write to")
+        Ok(t)  =>
+            match tioattrs.write_bytes(t, [])
+                Err(_) => test.assert(false)
+                Ok(n)  =>
+                    test.case("an empty write writes nothing")
+                    test.assert(n == 0)
+
+@test
+fn test_drain_and_flush_are_both_safe_to_call_on_a_settled_terminal() [io]
+    // `drain` before a restore, `flush_input` after a long pause: two
+    // calls a program makes at moments when there is nothing to do,
+    // and neither may turn that into an error.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — neither applies")
+        Ok(t)  =>
+            test.case("drained")
+            test.assert_none(tioattrs.drain(t))
+
+            test.case("input queue emptied")
+            test.assert_none(tioattrs.flush_input(t))
+
+@test
+fn test_a_pipe_has_no_size_and_the_answer_says_which_source_spoke() [io]
+    // The three sources in order, and the source named alongside the
+    // answer — which is the fact a program logs rather than leaving a
+    // user to wonder why it drew 80 columns wide on a 200-column
+    // terminal.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — the ioctl is not even tried")
+        Ok(t)  =>
+            match tiosize.size_of(t)
+                Err(_) => test.case("the ioctl refused, which is what CI looks like")
+                Ok(s)  =>
+                    test.case("a real size")
+                    test.assert(tiosize.size_is_valid(s))
+
+                    test.case("and setting it back changes nothing")
+                    test.assert_none(tiosize.set_size(t, s))
+
+@test
+fn test_the_environment_is_the_second_source_and_is_usually_absent() [io]
+    // `$LINES` and `$COLUMNS` are updated by a shell on its own
+    // SIGWINCH and by nothing else, so a program started before a
+    // resize inherits the old pair.  Second source, never the first.
+    match tiosize.size_from_env()
+        None    => test.case("unset, which is the common case")
+        Some(s) => test.assert(tiosize.size_is_valid(s))
+
+@test
+fn test_the_chain_always_answers_something_usable() [io]
+    // The point of `size_or_default`: there is no path through it that
+    // leaves a caller without a size to lay out on.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — the chain is not reachable from here")
+        Ok(t)  =>
+            let answer = tiosize.size_or_default(t)
+            test.case("always valid")
+            test.assert(tiosize.size_is_valid(answer.size))
+
+@test
+fn test_the_resize_watch_is_armed_explicitly_and_polled_afterwards() [io]
+    // Explicit arming rather than lazy, so a program that installs the
+    // handler before its first draw cannot lose a resize that arrives
+    // between the draw and the first poll.
+    tiosize.watch_size()
+
+    test.case("armed")
+    test.assert(tiosize.size_watch_is_armed())
+
+    test.case("and nothing has happened since")
+    test.assert(not tiosize.size_changed())
+
+@test
+fn test_the_cursor_probe_and_the_in_band_mode_are_the_two_fallbacks() [io]
+    // A serial line has no `TIOCGWINSZ`, and a terminal that speaks
+    // `CSI ? 2048 h` needs no SIGWINCH at all.  Both are named here
+    // rather than left to a caller to spell.
+    test.case("the probe writes bytes")
+    test.assert(list.len(tiosize.write_size_probe([])) > 0)
+
+    test.case("and the in-band mode is a mode, not a guess")
+    let _ = tiosize.in_band_resize_mode()
+
+@test
+fn test_entering_and_leaving_the_screen_spends_the_state_exactly_once() [io]
+    // The token discipline, on the screen side: the state records what
+    // was turned on, `leave_screen` turns off exactly that, and a
+    // second call does nothing rather than writing a teardown over a
+    // terminal somebody else has since set up.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — nothing to enter")
+        Ok(t)  =>
+            match tioscreen.enter_screen(t, tioscreen.inline_screen())
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.case("owing a teardown")
+                    test.assert(tioscreen.screen_is_pending(s))
+
+                    test.case("the teardown bytes undo what was set")
+                    test.assert(list.len(tioscreen.screen_restore_bytes([], s)) > 0)
+
+                    test.case("and leaving spends it")
+                    test.assert_none(tioscreen.leave_screen(s))
+
+@test
+fn test_the_mouse_and_the_cursor_are_the_two_toggles_a_live_session_changes() [io]
+    // An editor turns the mouse off while a selection is dragged with
+    // the keyboard, and shows the cursor while a prompt is open.  Both
+    // answer a new state rather than mutating one, so the teardown
+    // stays correct.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — nothing to toggle")
+        Ok(t)  =>
+            match tioscreen.enter_screen(t, tioscreen.full_screen())
+                Err(_) => test.assert(false)
+                Ok(s0) =>
+                    match tioscreen.set_mouse(s0, TioMouseOff)
+                        Err(_) => test.assert(false)
+                        Ok(s1) =>
+                            match tioscreen.set_cursor_visible(s1, true)
+                                Err(_) => test.assert(false)
+                                Ok(s2) =>
+                                    test.case("still owing a teardown")
+                                    test.assert(tioscreen.screen_is_pending(s2))
+                                    test.assert_none(tioscreen.leave_screen(s2))
+
+@test
+fn test_with_screen_is_the_one_call_a_full_screen_program_makes() [io]
+    // Raw mode and the screen, in the order that matters, undone in
+    // the order that matters, with the body's status coming back.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("no terminal — the body never runs")
+        Ok(t)  =>
+            match tioscreen.with_screen(t, TioRawKeepSignals, tioscreen.full_screen(), park)
+                Err(_)   => test.assert(false)
+                Ok(code) =>
+                    test.case("the body's status came back")
+                    test.assert(code == 0)
+
+@test
+fn test_a_reader_can_be_built_with_the_limits_a_legacy_terminal_needs() [io]
+    // A terminal that has not negotiated the kitty keyboard protocol
+    // should not have its bytes read as though it had.
+    let r = tioinput.reader_with(TioFd { fd: 0 }, tioinput.default_timeouts(),
+                                 keydecode.legacy_limits())
+
+    test.case("the reader took the limits")
+    test.assert(not tioinput.is_pending(r))
+
+    test.case("and its decoder can be replaced without losing the reader")
+    let r2 = tioinput.with_decoder(r, keydecode.decoder_new())
+    test.assert(not tioinput.is_pending(r2))
+
+@test
+fn test_a_read_on_a_pipe_answers_rather_than_blocking() [io]
+    // The failure this asserts against is the worst one available to a
+    // terminal library: a program that waits forever for input from a
+    // descriptor that will never have any.
+    let r = tioinput.reader(TioFd { fd: 0 })
+
+    test.case("readiness is a question, not a wait")
+    let _ = tioinput.input_is_ready(r)
+
+    match tioinput.read_step(r)
+        Err(_)   => test.case("refused, which is also an answer")
+        Ok(step) =>
+            test.case("a step came back")
+            test.assert(list.len(step.events) == 0 or step.at_eof)
+
+@test
+fn test_a_terminal_that_never_answers_is_reported_and_not_waited_for() [io]
+    // A pty with nothing on the other end is a terminal and answers
+    // nothing, which is a different question from whether the
+    // descriptor is a terminal at all — and the only way to ask it is
+    // to ask and give up.
+    match tioattrs.terminal(0)
+        Err(_) => test.case("not a terminal — the question does not arise")
+        Ok(t)  =>
+            let r = tioinput.reader(t)
+            test.case("the probe answers one way or the other")
+            let _ = tioinput.terminal_answers(r, t)

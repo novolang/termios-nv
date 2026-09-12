@@ -1,0 +1,171 @@
+// tioinput_tests.nv — the lone ESC, the deadline that has to win, and
+// the keystrokes a query must not eat.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`.
+//
+// NO TERMINAL IN MOST OF THIS FILE.  `feed_bytes`, `flush_pending`,
+// `is_pending` and `poll_deadline_ms` are `[]`, so the whole of the
+// decoding contract between this package and keymap-nv is assertable
+// against byte literals — which is also what a multiplexer reading its
+// client's keys off a socket is doing.
+//
+// THE VECTOR IS keymap-nv's OWN: `ESCAPE_TIMEOUT_MS = 25`, the number
+// vim, tmux and crossterm converge on.
+
+use keydecode
+use std.list
+use std.test
+use tioinput
+
+fn a_reader() -> TioInput
+    tioinput.reader(TioFd { fd: 0 })
+
+@test
+fn test_the_escape_deadline_defaults_to_the_one_keymap_nv_published() [io]
+    // The number is keymap-nv's and this package does not get to have
+    // an opinion about it: a decoder and a host that disagreed about
+    // how long to wait would resolve Escape differently depending on
+    // which one was asked.
+    test.case("the default is keymap-nv's constant")
+    test.assert(tioinput.default_timeouts().escape_ms == keydecode.ESCAPE_TIMEOUT_MS)
+
+@test
+fn test_a_lone_escape_is_held_and_not_reported() [io]
+    // The whole ambiguity: this byte is either the Escape key or the
+    // first of three, and the stream does not say.
+    let step = tioinput.feed_bytes(a_reader(), [0x1B])
+
+    test.case("nothing is reported yet")
+    test.assert(list.len(step.events) == 0)
+
+    test.case("and the reader says it is holding something")
+    test.assert(tioinput.is_pending(step.reader))
+
+@test
+fn test_the_second_byte_resolves_it_without_any_timeout() [io]
+    // `ESC [ A` is the up arrow, and it arrives as three bytes with no
+    // waiting involved at all.  The timeout only ever matters when the
+    // second byte does NOT come.
+    let s1 = tioinput.feed_bytes(a_reader(), [0x1B, 0x5B, 0x41])
+
+    test.case("one event")
+    test.assert(list.len(s1.events) == 1)
+
+    test.case("and nothing held")
+    test.assert(not tioinput.is_pending(s1.reader))
+
+@test
+fn test_the_flush_is_what_turns_a_held_escape_into_the_escape_key() [io]
+    // This is the contract with keymap-nv, in two calls: it holds, the
+    // host decides the deadline passed, and the host says so.
+    let held = tioinput.feed_bytes(a_reader(), [0x1B])
+    let out = tioinput.flush_pending(held.reader)
+
+    test.case("the Escape key")
+    test.assert(list.len(out.events) == 1)
+
+    test.case("and the reader is settled again")
+    test.assert(not tioinput.is_pending(out.reader))
+
+@test
+fn test_the_shorter_deadline_wins_while_a_sequence_is_held() [io]
+    // The one line of arithmetic a hand-written pump gets wrong.  With
+    // an idle tick of 50 ms and an escape deadline of 25, a loop that
+    // always polled with its tick leaves Escape unresolved for twice
+    // as long as it should — the key that feels stuck.
+    let idle = a_reader()
+    let held = tioinput.feed_bytes(idle, [0x1B]).reader
+
+    test.case("idle: the pump's own tick")
+    test.assert(tioinput.poll_deadline_ms(idle) == tioinput.timeouts_of(idle).read_ms)
+
+    test.case("holding: the escape deadline")
+    test.assert(tioinput.poll_deadline_ms(held) == tioinput.timeouts_of(held).escape_ms)
+
+@test
+fn test_a_reader_with_a_longer_link_can_say_so() [io]
+    // A session over a slow link splits sequences that a local
+    // terminal delivers in one read, so the number is a value rather
+    // than a constant.
+    let slow = TioTimeouts { escape_ms: 200, read_ms: 50, reply_ms: 1000 }
+    let r = tioinput.with_timeouts(a_reader(), slow)
+
+    test.case("the reader took it")
+    test.assert(tioinput.timeouts_of(r).escape_ms == 200)
+
+@test
+fn test_plain_typing_produces_one_event_per_byte() [io]
+    let step = tioinput.feed_bytes(a_reader(), [0x68, 0x65, 0x6C, 0x6C, 0x6F])
+
+    test.case("five keys")
+    test.assert(list.len(step.events) == 5)
+
+@test
+fn test_reply_watching_is_off_until_it_is_asked_for() [io]
+    // A program that asks the terminal nothing should not pay for a
+    // second parser over every byte its user types.
+    let plain = a_reader()
+    let watching = tioinput.watch_replies(plain, true)
+
+    test.case("off by default")
+    test.assert(not plain.watching_replies)
+
+    test.case("on when asked")
+    test.assert(watching.watching_replies)
+
+@test
+fn test_a_query_reply_is_a_reply_and_not_an_unknown_key() [io]
+    // keymap-nv reports `CSI 8 ; 40 ; 120 t` as `KeyUnknownSequence(t)`
+    // with the parameters thrown away — right for a key decoder, and
+    // the reason this reader runs ansi-nv's parser alongside when it
+    // has been asked a question.
+    let watching = tioinput.watch_replies(a_reader(), true)
+    let step = tioinput.feed_bytes(watching, [0x1B, 0x5B, 0x38, 0x3B, 0x34, 0x30, 0x3B, 0x31, 0x32, 0x30, 0x74])
+
+    test.case("one event")
+    test.assert(list.len(step.events) == 1)
+
+    test.case("and it is a reply, not a key")
+    match step.events[0]
+        TioReplyEvent(_) => test.assert(true)
+        TioKeyEvent(_)   => test.assert(false)
+
+@test
+fn test_the_same_bytes_are_an_unknown_key_when_nobody_asked() [io]
+    // The other half of the same claim: with reply-watching off the
+    // sequence goes through keymap-nv alone and comes out as what
+    // keymap-nv calls it.
+    let step = tioinput.feed_bytes(a_reader(), [0x1B, 0x5B, 0x38, 0x3B, 0x34, 0x30, 0x3B, 0x31, 0x32, 0x30, 0x74])
+
+    test.case("one event")
+    test.assert(list.len(step.events) == 1)
+
+    test.case("and it is a key")
+    match step.events[0]
+        TioKeyEvent(_)   => test.assert(true)
+        TioReplyEvent(_) => test.assert(false)
+
+@test
+fn test_a_bracketed_paste_is_bytes_and_not_commands() [io]
+    // `CSI 200 ~` opens a paste, `CSI 201 ~` closes it, and the single
+    // most valuable consequence is that an editor with a normal mode
+    // does not run a pasted block as a hundred keystrokes of commands.
+    let open = [0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]
+    let step = tioinput.feed_bytes(a_reader(), open)
+
+    test.case("the paste opened")
+    test.assert(list.len(step.events) == 1)
+
+    test.case("and the decoder knows it is inside one")
+    test.assert(keydecode.in_paste(tioinput.decoder_of(step.reader)))
+
+@test
+fn test_a_reader_over_a_pipe_reads_nothing_and_reports_eof() [io]
+    // CI's path through the `[io]` half, and the one a pump must
+    // handle: a reader whose descriptor closed answers `at_eof`, and a
+    // pump that ignored it spins.
+    match tioinput.read_available(a_reader())
+        Err(_)   => test.case("refused, which is also an answer")
+        Ok(step) =>
+            test.case("no events")
+            test.assert(list.len(step.events) == 0)

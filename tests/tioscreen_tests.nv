@@ -1,0 +1,121 @@
+// tioscreen_tests.nv — the exact bytes, and the order they go out in.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`.
+//
+// THE VECTORS ARE xterm's, not this package's.  `CSI ? 1049 h`, `CSI ?
+// 25 l`, `CSI ? 2004 h`, `CSI ? 1000 h`, `CSI ? 1006 h` are spelled
+// out in xterm's `ctlseqs` document and every terminal emulator
+// implements them from it, so a test that asserts anything else is
+// asserting a bug.
+
+use std.bytes
+use std.list
+use std.str
+use std.test
+use tioscreen
+
+fn text(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+fn has(hay: [u8], needle: Str) -> Bool
+    str.contains(bytes.byte_list_to_str(hay), needle)
+
+@test
+fn test_the_full_screen_preset_is_the_five_modes_a_full_screen_program_wants() [io]
+    let want = tioscreen.full_screen()
+
+    test.case("the alternate screen, in the spelling that saves the cursor")
+    test.assert(want.alt_screen)
+
+    test.case("no cursor — the program draws its own")
+    test.assert(want.hide_cursor)
+
+    test.case("bracketed paste, so a paste is not a hundred commands")
+    test.assert(want.bracketed_paste)
+
+    test.case("focus events")
+    test.assert(want.focus_events)
+
+    test.case("synchronised output, so a frame cannot tear")
+    test.assert(want.sync_output)
+
+@test
+fn test_the_inline_preset_does_not_steal_the_screen() [io]
+    // A fuzzy finder, a prompt, a progress display: it draws in the
+    // flow of the shell and its output stays in the scrollback.
+    let want = tioscreen.inline_screen()
+
+    test.case("no alternate screen")
+    test.assert(not want.alt_screen)
+
+    test.case("bracketed paste is still worth having")
+    test.assert(want.bracketed_paste)
+
+@test
+fn test_the_alternate_screen_is_1049_and_not_47() [io]
+    // 47 and 1047 switch buffers without saving the cursor, so a
+    // program that used them comes back with the cursor wherever the
+    // full-screen draw left it — on top of the user's prompt.  1049
+    // saves and restores it, which is why it is the only one here.
+    let out = tioscreen.screen_bytes([], tioscreen.full_screen())
+
+    test.case("1049")
+    test.assert(has(out, "\e[?1049h"))
+
+    test.case("and not 47")
+    test.assert(not has(out, "\e[?47h"))
+
+@test
+fn test_the_full_screen_preset_writes_every_mode_it_promises() [io]
+    let out = tioscreen.screen_bytes([], tioscreen.full_screen())
+
+    test.case("cursor hidden — DECTCEM reset")
+    test.assert(has(out, "\e[?25l"))
+
+    test.case("bracketed paste")
+    test.assert(has(out, "\e[?2004h"))
+
+    test.case("focus events")
+    test.assert(has(out, "\e[?1004h"))
+
+    test.case("synchronised output")
+    test.assert(has(out, "\e[?2026h"))
+
+@test
+fn test_every_mouse_setting_carries_the_sgr_encoding() [io]
+    // The older encoding packs a coordinate into one byte, so a click
+    // in column 224 arrives as a control character and a program with
+    // a wide terminal reads it as a keystroke.  `CSI ? 1006 h` is the
+    // only encoding that works past 223, and a setting that turned the
+    // mouse on without it would be a setting that breaks on a wide
+    // window.
+    let m = tioscreen.mouse_modes(TioMouseDrag)
+
+    test.case("drag is two modes, not one")
+    test.assert(list.len(m) == 2)
+
+@test
+fn test_mouse_off_asks_for_nothing() [io]
+    test.case("no modes")
+    test.assert(list.len(tioscreen.mouse_modes(TioMouseOff)) == 0)
+
+@test
+fn test_nothing_is_asked_for_by_the_empty_request() [io]
+    let out = tioscreen.screen_bytes([], tioscreen.no_screen())
+
+    test.case("no bytes at all")
+    test.assert(list.len(out) == 0)
+
+@test
+fn test_a_request_appends_to_the_callers_buffer() [io]
+    // The `core`-shaped contract ansi-nv sets and this module keeps: a
+    // caller's buffer goes in and comes back longer, so a frame's
+    // setup and its first paint are one write.
+    let seeded = text("hello")
+    let out = tioscreen.screen_bytes(seeded, tioscreen.full_screen())
+
+    test.case("the caller's bytes are still at the front")
+    test.assert(has(out, "hello"))
+
+    test.case("and the sequence is after them")
+    test.assert(list.len(out) > list.len(seeded))

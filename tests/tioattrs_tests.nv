@@ -1,0 +1,207 @@
+// tioattrs_tests.nv — what raw mode must turn off, what it must leave
+// alone, and the restore that cannot be skipped.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: termios-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// NO TERMINAL IN MOST OF THIS FILE, AND THAT IS THE MODULE'S CLAIM
+// WORKING.  `raw_attrs` is the whole of what "raw" means and it is
+// `[]`, so the flag table below is assertable against a value a test
+// made up.  The functions that genuinely need a descriptor are in one
+// section at the bottom and take the no-terminal path in CI, which is
+// itself the assertion.
+
+use std.test
+use tioattrs
+
+// The attributes a terminal comes up in: canonical, echoing, signals
+// on, everything the kernel defaults to.  Written out rather than read
+// from anywhere, because a test that needed a terminal to build its
+// input would be a test that does not run in CI.
+fn cooked() -> TioAttrs
+    TioAttrs {
+        flags: TioFlags {
+            echo: true,
+            canonical: true,
+            signals: true,
+            extended: true,
+            flow_control: true,
+            cr_to_nl: true,
+            output_processing: true,
+            break_interrupt: true,
+            strip_high_bit: false,
+            parity_check: false,
+            min_bytes: 0,
+            timeout_deciseconds: 0 },
+        opaque: [] }
+
+@test
+fn test_full_raw_turns_off_the_eight_flags_cfmakeraw_turns_off() [io]
+    // POSIX `cfmakeraw`, verbatim: ECHO, ICANON, ISIG and IEXTEN off
+    // in the local flags; IXON, ICRNL, BRKINT, ISTRIP and INPCK off in
+    // the input flags; OPOST off in the output flags.  Nine of the
+    // twelve named flags, and the list is the reference implementation
+    // rather than this package's opinion.
+    let f = tioattrs.flags_of(tioattrs.raw_attrs(cooked(), TioRawFull))
+
+    test.case("echo off")
+    test.assert(not f.echo)
+
+    test.case("line buffering off")
+    test.assert(not f.canonical)
+
+    test.case("signals off — Ctrl-C is a byte")
+    test.assert(not f.signals)
+
+    test.case("extended input off")
+    test.assert(not f.extended)
+
+    test.case("flow control off — Ctrl-S is bindable")
+    test.assert(not f.flow_control)
+
+    test.case("CR is not folded into LF")
+    test.assert(not f.cr_to_nl)
+
+    test.case("output post-processing off")
+    test.assert(not f.output_processing)
+
+    test.case("break does not raise SIGINT")
+    test.assert(not f.break_interrupt)
+
+    test.case("the eighth bit survives, so UTF-8 does")
+    test.assert(not f.strip_high_bit)
+
+@test
+fn test_full_raw_asks_for_one_byte_and_no_kernel_timer() [io]
+    // VMIN 1 / VTIME 0: a read answers as soon as one byte arrives and
+    // the kernel runs no timer of its own.  The escape-sequence
+    // timeout is `tioinput`'s and is four times shorter than the
+    // finest VTIME can express, which is why VTIME is not used for it.
+    let f = tioattrs.flags_of(tioattrs.raw_attrs(cooked(), TioRawFull))
+
+    test.case("VMIN")
+    test.assert(f.min_bytes == 1)
+
+    test.case("VTIME")
+    test.assert(f.timeout_deciseconds == 0)
+
+@test
+fn test_keep_signals_differs_from_full_raw_in_exactly_one_flag() [io]
+    // The mode an editor wants: everything raw, and Ctrl-C still
+    // reaches the process.  If it differed in anything else it would
+    // be a third mode rather than a variant of the first.
+    let full = tioattrs.flags_of(tioattrs.raw_attrs(cooked(), TioRawFull))
+    let keep = tioattrs.flags_of(tioattrs.raw_attrs(cooked(), TioRawKeepSignals))
+
+    test.case("signals are the difference")
+    test.assert(keep.signals)
+    test.assert(not full.signals)
+
+    test.case("and nothing else is")
+    test.assert(keep.echo == full.echo)
+    test.assert(keep.canonical == full.canonical)
+    test.assert(keep.extended == full.extended)
+    test.assert(keep.flow_control == full.flow_control)
+    test.assert(keep.cr_to_nl == full.cr_to_nl)
+    test.assert(keep.output_processing == full.output_processing)
+    test.assert(keep.min_bytes == full.min_bytes)
+
+@test
+fn test_cbreak_leaves_the_terminal_a_terminal() [io]
+    // Canonical and echo off, and NOTHING else touched.  A menu that
+    // used full raw mode would take away the user's Ctrl-C and their
+    // carriage returns for the sake of reading one keystroke.
+    let c = tioattrs.flags_of(tioattrs.raw_attrs(cooked(), TioCbreak))
+
+    test.case("keys arrive one at a time")
+    test.assert(not c.canonical)
+
+    test.case("and are not echoed")
+    test.assert(not c.echo)
+
+    test.case("signals still work")
+    test.assert(c.signals)
+
+    test.case("output is still post-processed")
+    test.assert(c.output_processing)
+
+    test.case("flow control is untouched")
+    test.assert(c.flow_control)
+
+@test
+fn test_the_opaque_bytes_survive_the_transformation() [io]
+    // The correctness condition of the whole design: raw mode overlays
+    // the named flags and copies everything else through.  A package
+    // that rebuilt the structure would reset the baud rate and VERASE
+    // along with it.
+    let a = TioAttrs { flags: cooked().flags, opaque: [1, 2, 3, 4, 5] }
+    let r = tioattrs.raw_attrs(a, TioRawFull)
+
+    test.case("byte for byte")
+    test.assert(r.opaque == a.opaque)
+
+@test
+fn test_a_value_that_is_already_raw_is_unchanged_by_raw_attrs() [io]
+    // Idempotent as arithmetic, which is a different claim from
+    // `enter_raw` being idempotent — it deliberately is not.
+    let once = tioattrs.raw_attrs(cooked(), TioRawFull)
+    let twice = tioattrs.raw_attrs(once, TioRawFull)
+
+    test.case("raw of raw is raw")
+    test.assert(tioattrs.attrs_eq(once, twice))
+
+@test
+fn test_raw_and_cooked_are_not_equal() [io]
+    // `attrs_eq` earning its place: a program uses it to skip a
+    // `tcsetattr` that would change nothing, and one that answered
+    // true here would skip the one that matters.
+    test.case("different")
+    test.assert(not tioattrs.attrs_eq(cooked(), tioattrs.raw_attrs(cooked(), TioRawFull)))
+
+@test
+fn test_with_flags_changes_the_flags_and_nothing_else() [io]
+    let a = TioAttrs { flags: cooked().flags, opaque: [7, 7, 7] }
+    let raw = tioattrs.raw_attrs(a, TioRawFull)
+    let b = tioattrs.with_flags(raw, cooked().flags)
+
+    test.case("the flags are the ones given")
+    test.assert(tioattrs.flags_of(b).echo)
+
+    test.case("the opaque bytes are still the original's")
+    test.assert(b.opaque == a.opaque)
+
+// ── The half that needs a descriptor ───────────────────────────────
+
+@test
+fn test_a_pipe_is_not_a_terminal() [io]
+    // The assertion that makes every other one in this file safe to
+    // run in CI: a test harness has a redirected stdin, and this
+    // package's answer to that is a refusal with a reason rather than
+    // a `tcgetattr` failing three calls later.
+    match tioattrs.terminal(0)
+        Ok(_)  => test.case("stdin is a terminal here")
+        Err(e) =>
+            test.case("refused, and the error names the descriptor")
+            match e
+                TioNotATerminal(fd) => test.assert(fd == 0)
+                _                   => test.assert(false)
+
+@test
+fn test_a_restore_token_starts_owing_the_terminal_a_restore() [io]
+    // The token is the design: holding one is holding the fact that
+    // the terminal has been changed and not yet put back.
+    match tioattrs.stdin_terminal()
+        Err(_) => test.case("no terminal — nothing to enter")
+        Ok(t)  =>
+            match tioattrs.enter_raw(t, TioRawFull)
+                Err(_) => test.assert(false)
+                Ok(r)  =>
+                    test.case("pending before")
+                    test.assert(tioattrs.restore_is_pending(r))
+
+                    test.case("and the saved attributes are the cooked ones")
+                    test.assert(tioattrs.flags_of(tioattrs.saved_attrs(r)).canonical)
+
+                    let _ = tioattrs.restore(r)
+                    test.case("restored")

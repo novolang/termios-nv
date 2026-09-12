@@ -1,0 +1,128 @@
+// tiosize_tests.nv — the fallback everybody agrees on, the two reply
+// forms, and the resize that changed nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`.
+//
+// THE VECTORS ARE THE ONES THE TOOLS AROUND US USE.  24 x 80 is what
+// `screen`, `tmux` and the standard library's own size probe fall back
+// to.  `CSI 8 ; rows ; cols t` and `CSI rows ; cols R` are xterm's
+// `ctlseqs` spellings of the two answers.
+
+use std.test
+use tioattrs
+use tiosize
+use vtquery
+
+@test
+fn test_the_fallback_is_the_one_every_other_tool_uses() [io]
+    // Not an arbitrary pair: a program that defaulted to anything else
+    // draws differently from every tool beside it on the same
+    // terminal.
+    let d = tiosize.default_size()
+
+    test.case("rows")
+    test.assert(d.rows == 24)
+
+    test.case("cols")
+    test.assert(d.cols == 80)
+
+    test.case("and no pixel dimensions to pretend about")
+    test.assert(d.pixel_width == 0)
+    test.assert(d.pixel_height == 0)
+
+@test
+fn test_a_size_in_the_middle_of_a_resize_is_not_valid() [io]
+    // A terminal can answer 0 x 0 while a window is being dragged, and
+    // a program that laid out a frame on it divides by zero.
+    test.case("zero rows")
+    test.assert(not tiosize.size_is_valid(tiosize.win_size(0, 80)))
+
+    test.case("zero columns")
+    test.assert(not tiosize.size_is_valid(tiosize.win_size(24, 0)))
+
+    test.case("both positive")
+    test.assert(tiosize.size_is_valid(tiosize.win_size(24, 80)))
+
+@test
+fn test_a_sigwinch_that_changed_nothing_compares_equal() [io]
+    // The reason a pump compares rather than trusting the flag: a
+    // window drag that rounds to the same cell grid still delivers a
+    // signal, and relaying out on it is work nobody asked for.
+    test.case("same")
+    test.assert(tiosize.size_eq(tiosize.win_size(24, 80), tiosize.win_size(24, 80)))
+
+    test.case("one column wider")
+    test.assert(not tiosize.size_eq(tiosize.win_size(24, 80), tiosize.win_size(24, 81)))
+
+@test
+fn test_a_terminal_that_reports_no_pixels_has_no_cell_size() [io]
+    // `None` rather than a guessed 8 x 16: a program that sized an
+    // image from a made-up cell draws it at the wrong scale, and the
+    // honest answer is that the terminal did not say.
+    test.case("nothing to divide")
+    test.assert_none(tiosize.cell_pixels(tiosize.win_size(24, 80)))
+
+@test
+fn test_the_cell_size_is_the_division_a_caller_would_get_wrong() [io]
+    let s = TioWinSize { rows: 24, cols: 80, pixel_width: 640, pixel_height: 384 }
+
+    match tiosize.cell_pixels(s)
+        None         => test.assert(false)
+        Some((w, h)) =>
+            test.case("cell width")
+            test.assert(w == 8)
+
+            test.case("cell height")
+            test.assert(h == 16)
+
+@test
+fn test_the_text_area_reply_is_read_as_a_size() [io]
+    // `CSI 8 ; 40 ; 120 t` — the answer to `CSI 1 8 t`.
+    match tiosize.size_from_reply(AnsiTextAreaSizeReply(40, 120))
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("rows")
+            test.assert(s.rows == 40)
+
+            test.case("cols")
+            test.assert(s.cols == 120)
+
+@test
+fn test_the_cursor_position_reply_is_read_as_a_size_too() [io]
+    // The oldest trick there is: park the cursor past the corner, ask
+    // where it ended up, and the clamped answer is the size.  A
+    // terminal that does not know `CSI 1 8 t` still knows this one.
+    match tiosize.size_from_reply(AnsiCursorPositionReply(40, 120))
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("rows")
+            test.assert(s.rows == 40)
+
+            test.case("cols")
+            test.assert(s.cols == 120)
+
+@test
+fn test_a_reply_to_some_other_question_is_not_a_size() [io]
+    // The reader hands back every reply it sees, and most of them are
+    // answers to questions somebody else asked.
+    test.case("device attributes are not a size")
+    test.assert_none(tiosize.size_from_reply(AnsiDeviceOkReply))
+
+@test
+fn test_the_size_query_is_the_text_area_query_and_not_a_guess() [io]
+    let q = tiosize.write_size_query([])
+    let same = vtquery.write_query([], AnsiTextAreaSizeQuery)
+
+    test.case("the same bytes ansi-nv writes for the same question")
+    test.assert(q == same)
+
+@test
+fn test_a_pipe_has_no_size_and_says_which_source_answered() [io]
+    // In CI stdin is a pipe: the ioctl refuses, the environment is
+    // usually unset, and the answer is the default with `TioSizeFromDefault`
+    // on it — which is the fact a program logs rather than leaving a
+    // user to wonder why it drew 80 columns wide on their 200-column
+    // terminal.
+    match tioattrs.terminal(0)
+        Ok(_)  => test.case("stdin is a terminal here")
+        Err(_) => test.case("no terminal — nothing to size")

@@ -1,0 +1,295 @@
+// tioscreen.nv — the alternate screen, the cursor, bracketed paste and
+// the mouse, as one state that restores exactly what it set.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SECOND HALF OF THE SAME BUG `tioattrs` EXISTS FOR.  A program
+// that enters the alternate screen, turns the cursor off and switches
+// the mouse on, and then exits without undoing them, leaves a terminal
+// with no cursor that reports every mouse move as garbage into the
+// user's shell.  It is the same failure as leaving raw mode on, it
+// happens on the same paths, and it wants the same answer.
+//
+// SO THE STATE IS A VALUE AND THE RESTORE IS DERIVED FROM IT.
+// `enter_screen` answers a `TioScreenState` recording what it actually
+// TURNED ON — not what the caller asked for — and `leave_screen`
+// resets those and nothing else.  The difference shows up in the one
+// case that matters: a program that asked for the mouse on a terminal
+// where it was already on must not turn it off on the way out, because
+// it did not turn it on.
+//
+// NOTHING HERE GUESSES WHAT THE TERMINAL SUPPORTS.  Setting a private
+// mode a terminal has never heard of is silently ignored by every
+// terminal, which is why the escape hatch is harmless; finding out
+// whether it took is a DECRQM round trip, and that is a query with a
+// reply, so it belongs with the other queries in `tiosize` and
+// `tioinput` rather than hidden inside an `enter`.
+//
+// THE BYTES ARE BUILDABLE WITHOUT A TERMINAL.  `screen_bytes` and
+// `screen_restore_bytes` are `[]` and answer the exact sequence, so a
+// test asserts the bytes rather than a terminal's behaviour, and a
+// program that has its own writer — a multiplexer writing into a
+// socket, a recorder writing to a file — uses them directly and never
+// calls the `[io]` half at all.
+
+use seqwrite
+use tioattrs
+
+// How much of the mouse a program wants reported.
+//
+// One enum rather than four booleans, because the four xterm modes are
+// cumulative and a program that set 1002 and 1003 both has said
+// something contradictory.  Every setting here implies the SGR
+// encoding (`CSI ? 1006 h`) as well, which is the only encoding that
+// works past column 223 — the older one packs a coordinate into a
+// byte, so column 224 arrives as a control character.
+pub enum TioMouseMode
+    // No mouse reporting.
+    TioMouseOff
+    // Button presses and releases.  `CSI ? 1000 h`.
+    TioMouseClicks
+    // Presses, releases, and motion while a button is held.
+    // `CSI ? 1002 h` — what a program with a draggable divider wants.
+    TioMouseDrag
+    // All of the above, and motion with no button down.
+    // `CSI ? 1003 h` — what a program with hover wants, and a
+    // firehose: every pixel of motion is a sequence.
+    TioMouseMotion
+
+// What a full-screen program wants the terminal to be.
+//
+// A request, not a state: `enter_screen` takes one of these and
+// answers what it actually changed.
+pub struct TioScreen
+    // `CSI ? 1049 h` — the alternate screen buffer, with the cursor
+    // saved and the screen cleared on the way in, and the user's
+    // scrollback untouched underneath.  The two older spellings, 47
+    // and 1047, do not save the cursor; a program that means "full
+    // screen" means 1049.
+    alt_screen: Bool
+    // `CSI ? 25 l` — hide the cursor, because a full-screen program
+    // draws its own.
+    hide_cursor: Bool
+    // `CSI ? 2004 h` — bracketed paste, so a pasted block arrives
+    // wrapped and an editor does not run it as a hundred keystrokes of
+    // commands.  The single most valuable line in this struct for an
+    // editor with a normal mode.
+    bracketed_paste: Bool
+    // `CSI ? 1004 h` — focus in and out, so a program can stop
+    // blinking a cursor nobody is looking at.
+    focus_events: Bool
+    // How much of the mouse to report.
+    mouse: TioMouseMode
+    // `CSI ? 2026 h` — synchronised output, so a frame written in
+    // several writes is presented in one and cannot tear.  Ignored by
+    // terminals that do not know it, which is the safe direction.
+    sync_output: Bool
+
+// What `enter_screen` actually turned on, and therefore what
+// `leave_screen` will turn off.
+//
+// Not the same as the `TioScreen` that was asked for, and that is the
+// whole reason it is a separate type.
+pub struct TioScreenState
+    applied: TioScreen
+    // The descriptor the state belongs to, so a restore cannot be
+    // written to the wrong terminal.
+    fd: TioFd
+    // False once `leave_screen` has spent it.
+    pending: Bool
+
+// The preset a full-screen program wants: alternate screen, no
+// cursor, bracketed paste, focus events, click-and-drag mouse,
+// synchronised output.
+//
+// ```novo
+// use tioscreen
+//
+// fn want() -> TioScreen
+//     tioscreen.full_screen()
+// ```
+pub fn full_screen() -> TioScreen []
+    todo("termios-nv.tioscreen.full_screen")
+
+// The preset a program that draws in the flow of the shell wants: no
+// alternate screen, no scrollback stolen, bracketed paste on, and
+// nothing else.
+//
+// What a prompt, a progress display or a fuzzy finder that prints its
+// result and leaves wants.
+//
+// ```novo
+// use tioscreen
+//
+// fn want() -> TioScreen
+//     tioscreen.inline_screen()
+// ```
+pub fn inline_screen() -> TioScreen []
+    todo("termios-nv.tioscreen.inline_screen")
+
+// Nothing on: the request that changes nothing.
+//
+// The base a program builds its own request from.
+//
+// ```novo
+// use tioscreen
+//
+// fn want() -> TioScreen
+//     tioscreen.no_screen()
+// ```
+pub fn no_screen() -> TioScreen []
+    todo("termios-nv.tioscreen.no_screen")
+
+// The exact bytes that put a terminal into this state.
+//
+// `[]`, and it is the half most programs should be using: a
+// multiplexer writes them into a pane's stream, a session recorder
+// writes them into a file, a test asserts them.
+//
+// ```novo
+// use tioscreen
+//
+// fn setup() -> [u8]
+//     tioscreen.screen_bytes([], tioscreen.full_screen())
+// ```
+pub fn screen_bytes(out: [u8], want: TioScreen) -> [u8] []
+    todo("termios-nv.tioscreen.screen_bytes")
+
+// The exact bytes that undo a state, in the reverse order.
+//
+// Reverse order is not decoration.  The cursor is restored by leaving
+// the alternate screen — `CSI ? 1049 l` puts back the cursor position
+// 1049 saved — so a sequence that showed the cursor first and left the
+// screen second would show it at a position the terminal is about to
+// overwrite, and the user sees it flash in the wrong place.
+//
+// ```novo
+// use tioscreen
+//
+// fn teardown(s: TioScreenState) -> [u8]
+//     tioscreen.screen_restore_bytes([], s)
+// ```
+pub fn screen_restore_bytes(out: [u8], s: TioScreenState) -> [u8] []
+    todo("termios-nv.tioscreen.screen_restore_bytes")
+
+// The modes one mouse setting turns on, in the order they are set.
+//
+// Exposed because a program that negotiates its own modes wants the
+// list rather than the bytes, and because it is the honest answer to
+// "what does `TioMouseDrag` actually do" — two modes, not one.
+//
+// ```novo
+// use seqwrite
+// use tioscreen
+//
+// fn modes() -> [AnsiMode]
+//     tioscreen.mouse_modes(TioMouseDrag)
+// ```
+pub fn mouse_modes(m: TioMouseMode) -> [seqwrite.AnsiMode] []
+    todo("termios-nv.tioscreen.mouse_modes")
+
+// ── The half that writes ───────────────────────────────────────────
+
+// Put the terminal into the requested state, and answer what was
+// changed.
+//
+// One `write_bytes` of one buffer: every mode goes out together, so a
+// program cannot be interrupted between hiding the cursor and entering
+// the alternate screen.
+//
+// ```novo
+// use tioattrs
+// use tioscreen
+//
+// fn start(t: TioFd) -> Result<TioScreenState, TioError> [io]
+//     tioscreen.enter_screen(t, tioscreen.full_screen())
+// ```
+pub fn enter_screen(t: TioFd, want: TioScreen) -> Result<TioScreenState, TioError> [io]
+    todo("termios-nv.tioscreen.enter_screen")
+
+// Undo exactly what `enter_screen` did.
+//
+// Spent tokens are a no-op, for the same reason `tioattrs.restore`'s
+// are: writing a teardown over a terminal somebody else has since set
+// up is worse than doing nothing.
+//
+// ```novo
+// use tioattrs
+// use tioscreen
+//
+// fn finish(s: TioScreenState) -> ?TioError [io]
+//     tioscreen.leave_screen(s)
+// ```
+pub fn leave_screen(s: TioScreenState) -> ?TioError [io]
+    todo("termios-nv.tioscreen.leave_screen")
+
+// Whether a state still owes the terminal a teardown.
+//
+// ```novo
+// use tioscreen
+//
+// fn owes(s: TioScreenState) -> Bool
+//     tioscreen.screen_is_pending(s)
+// ```
+pub fn screen_is_pending(s: TioScreenState) -> Bool []
+    todo("termios-nv.tioscreen.screen_is_pending")
+
+// Change the mouse setting inside a live session, answering the new
+// state.
+//
+// The one toggle a program changes while running: an editor turns the
+// mouse off while a selection is being dragged with the keyboard, and
+// a program with a mouse-driven mode turns it on only in that mode.
+//
+// ```novo
+// use tioscreen
+//
+// fn quieten(s: TioScreenState) -> Result<TioScreenState, TioError> [io]
+//     tioscreen.set_mouse(s, TioMouseOff)
+// ```
+pub fn set_mouse(s: TioScreenState, m: TioMouseMode) -> Result<TioScreenState, TioError> [io]
+    todo("termios-nv.tioscreen.set_mouse")
+
+// Show or hide the cursor inside a live session.
+//
+// ```novo
+// use tioscreen
+//
+// fn reveal(s: TioScreenState) -> Result<TioScreenState, TioError> [io]
+//     tioscreen.set_cursor_visible(s, true)
+// ```
+pub fn set_cursor_visible(s: TioScreenState, visible: Bool) -> Result<TioScreenState, TioError> [io]
+    todo("termios-nv.tioscreen.set_cursor_visible")
+
+// ── Raw mode and the screen, together ──────────────────────────────
+
+// Enter raw mode, enter the screen, run `body`, and undo both in the
+// right order whatever the body does.
+//
+// **This is the one call a full-screen program makes.**  It is
+// `tioattrs.with_raw` and `enter_screen` composed, and the composition
+// is worth a function because the ORDER is not obvious and getting it
+// wrong is visible: raw mode first, so the keys typed during setup are
+// discarded by the `TCSAFLUSH` rather than echoed onto the screen
+// being drawn; and the screen is left before the attributes are
+// restored, so the user's shell prompt is painted on the main screen
+// under the mode it expects.
+//
+// ```novo
+// use tioattrs
+// use tioscreen
+//
+// fn draw_until_quit(t: TioFd) -> Int [io]
+//     0
+//
+// fn main() [io]
+//     match tioattrs.stdin_terminal()
+//         Err(_) => println("not a terminal")
+//         Ok(t)  =>
+//             match tioscreen.with_screen(t, TioRawKeepSignals, tioscreen.full_screen(), draw_until_quit)
+//                 Ok(code) => println("${code}")
+//                 Err(_)   => println("could not take the terminal")
+// ```
+pub fn with_screen(t: TioFd, mode: TioRawMode, want: TioScreen,
+                   body: fn(TioFd) -> Int [io]) -> Result<Int, TioError> [io]
+    todo("termios-nv.tioscreen.with_screen")

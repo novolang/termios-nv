@@ -1,0 +1,345 @@
+// tiosize.nv — how big the terminal is, and how a program finds out it
+// has changed.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// SIGWINCH IS NOT HANDLED HERE, IT IS POLLED.  A signal handler is a
+// function the kernel calls at a moment of its choosing, and the only
+// useful thing such a function may do is set a flag.  Registering one
+// means handing a callback across a layer, and a callback that closed
+// over the program's state is exactly what neither a `core`-shaped
+// design nor a signal context can have.  So the flag is the interface:
+// `watch_size` installs the handler, `size_changed` is the
+// test-and-clear, and the program's own loop decides what a resize
+// means and when.
+//
+// It is also the shape the standard library already uses —
+// `process.shutdown_requested()` is the same test-and-clear over
+// SIGTERM and SIGINT — so a pump that polls for both reads
+// consistently.
+//
+// THE SIZE HAS THREE SOURCES AND A PROGRAM MAY NEED ALL THREE.
+//
+//   1. `TIOCGWINSZ` on the descriptor.  Right, cheap, and what
+//      `size_of` does.  Unavailable over a serial line, and wrong
+//      inside a multiplexer that has not propagated a resize yet.
+//   2. `$LINES` and `$COLUMNS`.  What a shell exports and what a
+//      script has.  Frequently stale — they are updated by the shell
+//      on its own SIGWINCH and not by anything else.
+//   3. Asking the terminal.  `CSI 1 8 t` answers `CSI 8 ; rows ;
+//      cols t`, and the cursor-position round trip answers it for a
+//      terminal that does not know that one.  A REPLY ARRIVES AS
+//      INPUT, which means the program must be reading, must have a
+//      timeout, and must be prepared for the reply to interleave with
+//      a keystroke — which is why the query half is here and the
+//      reading half is `tioinput`'s.
+//
+// `size_or_default` is the order most programs want, and it is a
+// function rather than a paragraph so that a program gets the order
+// right by calling it.
+
+use seqwrite
+use tioattrs
+use vtquery
+
+// A terminal's size, in cells and in pixels.
+//
+// The pixel pair is almost always `0, 0` and is here anyway: it is
+// what an image protocol — sixel, kitty, iTerm2 — needs to size a
+// picture to a cell grid, and a program that has to ask for it
+// separately is a program that asks for it with a second ioctl it
+// could have had for free.
+pub struct TioWinSize
+    rows: Int
+    cols: Int
+    // Width of the text area in pixels, or 0 when the terminal does
+    // not report one.
+    pixel_width: Int
+    // Height of the text area in pixels, or 0.
+    pixel_height: Int
+
+// Where a size came from.
+//
+// Carried alongside the size because the three sources are not equally
+// trustworthy, and a program that draws a full-screen frame on a
+// defaulted 24 x 80 should be able to say so in its logs rather than
+// leaving a user to wonder why their 200-column terminal is drawing
+// narrow.
+pub enum TioSizeSource
+    // `TIOCGWINSZ` answered.
+    TioSizeFromIoctl
+    // `$LINES` and `$COLUMNS` answered.
+    TioSizeFromEnv
+    // The terminal answered a query.
+    TioSizeFromQuery
+    // Nothing answered and `default_size` was used.
+    TioSizeFromDefault
+
+// A size and where it came from.
+pub struct TioSizeAnswer
+    size: TioWinSize
+    source: TioSizeSource
+
+// The fallback every terminal program has: 24 rows by 80 columns.
+//
+// The same numbers `screen`, `tmux` and the standard library's own
+// size probe fall back to, so a program that defaults here is a
+// program that agrees with the tools around it.
+//
+// ```novo
+// use tiosize
+//
+// fn rows() -> Int
+//     tiosize.default_size().rows
+// ```
+pub fn default_size() -> TioWinSize []
+    todo("termios-nv.tiosize.default_size")
+
+// A size from rows and columns, with no pixel dimensions.
+//
+// ```novo
+// use tiosize
+//
+// fn small() -> TioWinSize
+//     tiosize.win_size(24, 80)
+// ```
+pub fn win_size(rows: Int, cols: Int) -> TioWinSize []
+    todo("termios-nv.tiosize.win_size")
+
+// Whether two sizes are the same in every dimension.
+//
+// What a pump compares against its last known size, so a SIGWINCH that
+// did not actually change anything — and they happen — costs no
+// relayout.
+//
+// ```novo
+// use tiosize
+//
+// fn same(a: TioWinSize, b: TioWinSize) -> Bool
+//     tiosize.size_eq(a, b)
+// ```
+pub fn size_eq(a: TioWinSize, b: TioWinSize) -> Bool []
+    todo("termios-nv.tiosize.size_eq")
+
+// Whether a size is usable: both dimensions positive.
+//
+// A terminal in the middle of being resized can answer 0 x 0, and a
+// program that laid out a frame on it divides by zero.
+//
+// ```novo
+// use tiosize
+//
+// fn usable(s: TioWinSize) -> Bool
+//     tiosize.size_is_valid(s)
+// ```
+pub fn size_is_valid(s: TioWinSize) -> Bool []
+    todo("termios-nv.tiosize.size_is_valid")
+
+// The size of one cell in pixels, or `None` when the terminal reports
+// no pixel dimensions.
+//
+// The number an image protocol actually wants, and the division a
+// caller would otherwise get wrong by rounding it the other way.
+//
+// ```novo
+// use tiosize
+//
+// fn cell(s: TioWinSize) -> ?(Int, Int)
+//     tiosize.cell_pixels(s)
+// ```
+pub fn cell_pixels(s: TioWinSize) -> ?(Int, Int) []
+    todo("termios-nv.tiosize.cell_pixels")
+
+// ── Asking the kernel ──────────────────────────────────────────────
+
+// `TIOCGWINSZ` on the descriptor.
+//
+// ```novo
+// use tioattrs
+// use tiosize
+//
+// fn rows(t: TioFd) -> Int [io]
+//     match tiosize.size_of(t)
+//         Ok(s)  => s.rows
+//         Err(_) => tiosize.default_size().rows
+// ```
+pub fn size_of(t: TioFd) -> Result<TioWinSize, TioError> [io]
+    todo("termios-nv.tiosize.size_of")
+
+// `TIOCSWINSZ` on the descriptor.
+//
+// On a terminal this is almost never what a program wants: the size is
+// the window's and setting it lies to every program reading the other
+// end.  On a **pty master** it is exactly what a program wants, and it
+// is how pty-nv's `resize` is implemented — the kernel raises SIGWINCH
+// in the child's foreground process group, and the child redraws.
+//
+// ```novo
+// use tioattrs
+// use tiosize
+//
+// fn tell_child(master: TioFd, s: TioWinSize) -> ?TioError [io]
+//     tiosize.set_size(master, s)
+// ```
+pub fn set_size(t: TioFd, s: TioWinSize) -> ?TioError [io]
+    todo("termios-nv.tiosize.set_size")
+
+// `$LINES` and `$COLUMNS`, when both are set and both parse.
+//
+// Stale more often than not — a shell updates them on its own
+// SIGWINCH and a program started before a resize inherits the old
+// pair — so this is the second source and not the first.
+//
+// ```novo
+// use tiosize
+//
+// fn from_env() -> ?TioWinSize [io]
+//     tiosize.size_from_env()
+// ```
+pub fn size_from_env() -> ?TioWinSize [io]
+    todo("termios-nv.tiosize.size_from_env")
+
+// The three sources in the order a program wants them, with the one
+// that answered named.
+//
+// ioctl, then environment, then `default_size`.  The terminal query is
+// NOT in this chain and that is deliberate: it needs the program to be
+// reading input and to have a timeout, which is a different kind of
+// call, and a size probe that silently blocked on a reply that never
+// came would be the worst failure in this package.
+//
+// ```novo
+// use tioattrs
+// use tiosize
+//
+// fn best(t: TioFd) -> TioSizeAnswer [io]
+//     tiosize.size_or_default(t)
+// ```
+pub fn size_or_default(t: TioFd) -> TioSizeAnswer [io]
+    todo("termios-nv.tiosize.size_or_default")
+
+// ── SIGWINCH, as a poll ────────────────────────────────────────────
+
+// Install the SIGWINCH handler.
+//
+// Explicit rather than lazy, so a program that installs it before its
+// first draw cannot lose a resize that arrives between the draw and
+// the first poll.  Calling it twice is harmless.
+//
+// ```novo
+// use tiosize
+//
+// fn arm() [io]
+//     tiosize.watch_size()
+// ```
+pub fn watch_size() [io]
+    todo("termios-nv.tiosize.watch_size")
+
+// Test-and-clear: has the terminal been resized since the last ask?
+//
+// Installs the handler on the first call, so a program that only polls
+// still works; `watch_size` exists for the program that wants the
+// handler in place earlier than its first poll.
+//
+// This answers "a SIGWINCH arrived", not "the size is different".  A
+// window manager can deliver one for a resize that rounds to the same
+// cell grid, so a pump that relays out on every true answer relays out
+// more often than it needs to — compare with `size_eq` and skip.
+//
+// ```novo
+// use tioattrs
+// use tiosize
+//
+// fn tick(t: TioFd, last: TioWinSize) -> TioWinSize [io]
+//     if tiosize.size_changed()
+//         match tiosize.size_of(t)
+//             Ok(s)  => s
+//             Err(_) => last
+//     else
+//         last
+// ```
+pub fn size_changed() -> Bool [io]
+    todo("termios-nv.tiosize.size_changed")
+
+// Whether the handler is installed.
+//
+// ```novo
+// use tiosize
+//
+// fn armed() -> Bool [io]
+//     tiosize.size_watch_is_armed()
+// ```
+pub fn size_watch_is_armed() -> Bool [io]
+    todo("termios-nv.tiosize.size_watch_is_armed")
+
+// ── Asking the terminal ────────────────────────────────────────────
+
+// The bytes that ask the terminal how big its text area is.
+//
+// `[]`, because building the question is arithmetic; ansi-nv writes
+// it and this function is the one line that names the right query.
+// Writing it is `tioattrs.write_bytes`, and reading the answer is
+// `tioinput`'s — the reply arrives as INPUT, interleaved with whatever
+// the user is typing, and only the party doing the reading has a
+// timeout for an answer that never comes.
+//
+// ```novo
+// use tiosize
+//
+// fn ask(out: [u8]) -> [u8]
+//     tiosize.write_size_query(out)
+// ```
+pub fn write_size_query(out: [u8]) -> [u8] []
+    todo("termios-nv.tiosize.write_size_query")
+
+// The cursor-position round trip, for a terminal that does not answer
+// `CSI 1 8 t`.
+//
+// The oldest trick there is: park the cursor past the bottom right
+// corner, ask where it ended up, and the answer is the size — because
+// the terminal clamps.  Restores the cursor afterwards, which is why
+// it is one function and not three.
+//
+// ```novo
+// use tiosize
+//
+// fn ask_the_hard_way(out: [u8]) -> [u8]
+//     tiosize.write_size_probe(out)
+// ```
+pub fn write_size_probe(out: [u8]) -> [u8] []
+    todo("termios-nv.tiosize.write_size_probe")
+
+// A size read out of a terminal's reply, or `None` when the reply was
+// answering some other question.
+//
+// Takes both forms: `CSI 8 ; rows ; cols t` from the text-area query,
+// and `CSI rows ; cols R` from the cursor-position probe.
+//
+// ```novo
+// use tiosize
+// use vtquery
+//
+// fn read_it(r: AnsiReply) -> ?TioWinSize
+//     tiosize.size_from_reply(r)
+// ```
+pub fn size_from_reply(r: vtquery.AnsiReply) -> ?TioWinSize []
+    todo("termios-nv.tiosize.size_from_reply")
+
+// The mode a program sets so the terminal reports a resize as an
+// escape sequence rather than as a signal.
+//
+// `CSI ? 2048 h` — in-band resize notifications.  Newer than most of
+// what is in this package and not universally supported, and worth
+// having named: a program that gets them does not need SIGWINCH at
+// all, which matters most in the one place signals are awkward, a
+// program running its loop on another thread.
+//
+// ```novo
+// use seqwrite
+// use tiosize
+//
+// fn ask_for_reports(out: [u8]) -> [u8]
+//     seqwrite.set_mode(out, tiosize.in_band_resize_mode())
+// ```
+pub fn in_band_resize_mode() -> seqwrite.AnsiMode []
+    todo("termios-nv.tiosize.in_band_resize_mode")

@@ -1,0 +1,380 @@
+// tioinput.nv — raw bytes off a terminal, key events out, and the
+// timeout keymap-nv deliberately does not have.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE OTHER HALF OF A DESIGN keymap-nv PUBLISHED WITH A
+// HOLE IN IT, ON PURPOSE.  A lone `0x1B` is either the Escape key or
+// the first byte of a sequence, and nothing in the byte stream says
+// which; what says which is whether another byte arrives within a few
+// milliseconds.  keymap-nv is `core` and has no clock, so it holds the
+// ambiguous bytes, reports `pending`, and resolves them when the host
+// calls `flush`.  The host is this module.  `TioTimeouts.escape_ms` is
+// that number, as a value, defaulting to keymap-nv's own
+// `ESCAPE_TIMEOUT_MS`.
+//
+// THE READ IS THE TIMER.  There is no clock read anywhere in this
+// package: waiting for the byte after an ESC is a poll with a
+// deadline, the standard library's `io.wait_either` takes one, and a
+// poll that returns empty IS the timeout expiring.  That is why the
+// package is `[io]` and not `[io, time]` — the deadline is an argument
+// to a syscall, not a reading of a clock.
+//
+// A TERMINAL'S REPLIES ARRIVE AS INPUT, MIXED WITH TYPING.  A program
+// that asks `CSI 1 8 t` for the window size gets the answer through
+// the same descriptor the user is typing into, and the user does not
+// stop typing while it waits.  keymap-nv reports such a sequence as
+// `KeyUnknownSequence` with its final byte and without its parameters
+// — correct for a key decoder, useless for reading `CSI 8 ; 40 ; 120
+// t` — so when reply-watching is armed this reader runs ansi-nv's
+// `vtparse` over the same bytes and answers typed `AnsiReply`s
+// alongside the keys.  Two parsers, one byte stream, and no byte
+// belongs to both: a reply is not a key and a key is not a reply.
+//
+// `ask` IS THE FUNCTION THAT MAKES THAT USABLE.  It writes a query,
+// waits for its answer, and hands back EVERY KEY THAT ARRIVED WHILE IT
+// WAITED.  A program that dropped them loses the keystrokes a user
+// typed during startup, which is the bug where a fast typist's first
+// two characters vanish.
+
+use keydecode
+use tioattrs
+use vtquery
+
+// The three deadlines a terminal read has, in milliseconds.
+//
+// Three and not one, because they answer different questions and a
+// program that conflated them either feels sluggish or resolves Escape
+// wrongly.
+pub struct TioTimeouts
+    // How long to wait for the byte after a lone ESC before deciding
+    // the user pressed Escape.  Defaults to keymap-nv's
+    // `ESCAPE_TIMEOUT_MS`, which is the 25 ms vim, tmux and crossterm
+    // converge on.  A session over a high-latency link wants more.
+    escape_ms: Int
+    // How long `read_step` waits for anything at all before answering
+    // an empty step.  This is the pump's tick, and it is the caller's
+    // business: an editor that has a cursor to blink wants a short one,
+    // a program with nothing to do while idle wants a long one, and a
+    // negative value means wait until something arrives.
+    read_ms: Int
+    // How long `ask` waits for a terminal to answer a query before
+    // giving up.  Longer than the others by a lot — a terminal that
+    // does not know a query never answers it, and the only cost of
+    // waiting is a slower start.
+    reply_ms: Int
+
+// A terminal being read: the descriptor, the key decoder, the
+// deadlines, and — when armed — the escape-sequence parser watching
+// for replies.
+pub struct TioInput
+    fd: TioFd
+    keys: keydecode.KeyDecoder
+    timeouts: TioTimeouts
+    // Whether replies are being watched.  Off by default: a program
+    // that asks the terminal nothing should not pay for a second
+    // parser over every byte it types.
+    watching_replies: Bool
+
+// One thing that arrived.
+pub enum TioInputEvent
+    // A key, a mouse report, a paste byte, a focus change — whatever
+    // keymap-nv made of the bytes.
+    TioKeyEvent(event: keydecode.KeyEvent)
+    // An answer to a question this program asked.  Only ever present
+    // when reply-watching is armed.
+    TioReplyEvent(reply: vtquery.AnsiReply)
+
+// A read's worth of progress: what arrived, and the reader to carry
+// on with.
+pub struct TioInputStep
+    reader: TioInput
+    events: [TioInputEvent]
+    // True when the deadline passed with no byte arriving.  Not an
+    // error: it is how a pump gets its tick, and it is what resolves a
+    // held ESC — a step that timed out with a pending decoder has
+    // already flushed it, and the Escape key is in `events`.
+    timed_out: Bool
+    // True when the terminal closed.  A pump that ignores this spins.
+    at_eof: Bool
+
+// What `ask` answers: the reply if it came, and every key that arrived
+// while waiting for it.
+pub struct TioAsked
+    reader: TioInput
+    // `None` when the terminal did not answer within `reply_ms`,
+    // which is how a program learns a terminal does not support a
+    // query — there is no other way to learn it.
+    reply: ?vtquery.AnsiReply
+    // The keys the user typed while the terminal was being asked.
+    // Handed back rather than dropped, because dropping them is the
+    // bug where the first characters a fast typist types at startup
+    // disappear.
+    keys: [keydecode.KeyEvent]
+
+// The defaults: keymap-nv's escape timeout, a 50 ms tick, and a
+// second for a query.
+//
+// ```novo
+// use tioinput
+//
+// fn tick() -> Int
+//     tioinput.default_timeouts().read_ms
+// ```
+pub fn default_timeouts() -> TioTimeouts []
+    todo("termios-nv.tioinput.default_timeouts")
+
+// A reader over a terminal, with the default timeouts and keymap-nv's
+// default limits.
+//
+// ```novo
+// use tioattrs
+// use tioinput
+//
+// fn start(t: TioFd) -> TioInput
+//     tioinput.reader(t)
+// ```
+pub fn reader(t: TioFd) -> TioInput []
+    todo("termios-nv.tioinput.reader")
+
+// A reader with the deadlines and the decoder limits spelled out.
+//
+// `keydecode.legacy_limits()` is the one to pass for a terminal that
+// has not negotiated the kitty keyboard protocol.
+//
+// ```novo
+// use keydecode
+// use tioattrs
+// use tioinput
+//
+// fn start(t: TioFd) -> TioInput
+//     tioinput.reader_with(t, tioinput.default_timeouts(), keydecode.legacy_limits())
+// ```
+pub fn reader_with(t: TioFd, ts: TioTimeouts, limits: keydecode.KeyLimits) -> TioInput []
+    todo("termios-nv.tioinput.reader_with")
+
+// Arm or disarm reply watching.
+//
+// Armed, every byte goes through ansi-nv's parser as well as
+// keymap-nv's, and an answer to a query comes back as a typed
+// `AnsiReply` instead of a `KeyUnknownSequence` with its parameters
+// thrown away.  `ask` arms it for the duration of a query on its own,
+// so this is for the program that asks once at startup and wants to
+// keep watching — a terminal can send an unsolicited report.
+//
+// ```novo
+// use tioinput
+//
+// fn watch(r: TioInput) -> TioInput
+//     tioinput.watch_replies(r, true)
+// ```
+pub fn watch_replies(r: TioInput, on: Bool) -> TioInput []
+    todo("termios-nv.tioinput.watch_replies")
+
+// ── Reading ────────────────────────────────────────────────────────
+
+// Wait up to `read_ms`, read whatever arrived, and decode it.
+//
+// The one call a pump makes.  When the wait ends with nothing and the
+// decoder is holding an ambiguous sequence, this flushes it — which is
+// the entire contract between this package and keymap-nv, in one
+// place.
+//
+// The wait is `escape_ms` rather than `read_ms` while the decoder is
+// pending, because a held ESC has a shorter deadline than an idle
+// pump and the shorter one must win.
+//
+// ```novo
+// use tioinput
+//
+// fn once(r: TioInput) -> Result<TioInputStep, TioError> [io]
+//     tioinput.read_step(r)
+// ```
+pub fn read_step(r: TioInput) -> Result<TioInputStep, TioError> [io]
+    todo("termios-nv.tioinput.read_step")
+
+// Read everything already buffered and decode it, waiting for nothing.
+//
+// What a pump calls after a poll told it the descriptor is readable,
+// and what a coalescing loop calls to drain a burst before it draws.
+//
+// ```novo
+// use tioinput
+//
+// fn drain(r: TioInput) -> Result<TioInputStep, TioError> [io]
+//     tioinput.read_available(r)
+// ```
+pub fn read_available(r: TioInput) -> Result<TioInputStep, TioError> [io]
+    todo("termios-nv.tioinput.read_available")
+
+// Whether a read would answer immediately.
+//
+// ```novo
+// use tioinput
+//
+// fn has_input(r: TioInput) -> Bool [io]
+//     tioinput.input_is_ready(r)
+// ```
+pub fn input_is_ready(r: TioInput) -> Bool [io]
+    todo("termios-nv.tioinput.input_is_ready")
+
+// ── The half with no terminal in it ────────────────────────────────
+
+// Decode bytes the caller already has.
+//
+// `[]`, and it is what makes the decoding half of this package
+// testable and reusable.  A multiplexer in daemon mode reads its
+// client's keystrokes off a unix socket rather than off a terminal; a
+// session replayer reads them out of a file; a test writes them as a
+// literal.  All three want this and none of them wants a descriptor.
+//
+// ```novo
+// use tioinput
+//
+// fn decode(r: TioInput, chunk: [u8]) -> TioInputStep
+//     tioinput.feed_bytes(r, chunk)
+// ```
+pub fn feed_bytes(r: TioInput, chunk: [u8]) -> TioInputStep []
+    todo("termios-nv.tioinput.feed_bytes")
+
+// Resolve whatever the decoder is holding, on the caller's own
+// judgement that the deadline has passed.
+//
+// For the caller whose loop does its own waiting — a program whose
+// poll covers a socket and a terminal together, and which therefore
+// knows about the timeout before this package could.
+//
+// ```novo
+// use tioinput
+//
+// fn settle(r: TioInput) -> TioInputStep
+//     tioinput.flush_pending(r)
+// ```
+pub fn flush_pending(r: TioInput) -> TioInputStep []
+    todo("termios-nv.tioinput.flush_pending")
+
+// Whether the decoder is holding bytes it cannot yet resolve.
+//
+// True exactly when a timeout would produce an event, which is what a
+// loop with its own poll needs to know to pick the shorter deadline.
+//
+// ```novo
+// use tioinput
+//
+// fn holding(r: TioInput) -> Bool
+//     tioinput.is_pending(r)
+// ```
+pub fn is_pending(r: TioInput) -> Bool []
+    todo("termios-nv.tioinput.is_pending")
+
+// The deadline this reader should poll with right now, in
+// milliseconds.
+//
+// `escape_ms` while the decoder is pending and `read_ms` otherwise —
+// the one line of arithmetic a caller running its own poll would
+// otherwise have to rediscover, and the one it gets wrong by using
+// `read_ms` always and leaving Escape unresolved for a whole tick.
+//
+// ```novo
+// use tioinput
+//
+// fn wait_for(r: TioInput) -> Int
+//     tioinput.poll_deadline_ms(r)
+// ```
+pub fn poll_deadline_ms(r: TioInput) -> Int []
+    todo("termios-nv.tioinput.poll_deadline_ms")
+
+// The key decoder inside, for a caller that wants keymap-nv's own
+// surface.
+//
+// ```novo
+// use keydecode
+// use tioinput
+//
+// fn pasting(r: TioInput) -> Bool
+//     keydecode.in_paste(tioinput.decoder_of(r))
+// ```
+pub fn decoder_of(r: TioInput) -> keydecode.KeyDecoder []
+    todo("termios-nv.tioinput.decoder_of")
+
+// The same reader with a different decoder — after a `reset`, or after
+// negotiating a protocol the old limits refused.
+//
+// ```novo
+// use keydecode
+// use tioinput
+//
+// fn restart(r: TioInput) -> TioInput
+//     tioinput.with_decoder(r, keydecode.decoder_new())
+// ```
+pub fn with_decoder(r: TioInput, d: keydecode.KeyDecoder) -> TioInput []
+    todo("termios-nv.tioinput.with_decoder")
+
+// The reader's deadlines.
+//
+// ```novo
+// use tioinput
+//
+// fn escape_wait(r: TioInput) -> Int
+//     tioinput.timeouts_of(r).escape_ms
+// ```
+pub fn timeouts_of(r: TioInput) -> TioTimeouts []
+    todo("termios-nv.tioinput.timeouts_of")
+
+// The same reader with different deadlines — a pump that slows its
+// tick while idle changes one here rather than rebuilding the reader
+// and losing the bytes it was holding.
+//
+// ```novo
+// use tioinput
+//
+// fn slow_down(r: TioInput, ts: TioTimeouts) -> TioInput
+//     tioinput.with_timeouts(r, ts)
+// ```
+pub fn with_timeouts(r: TioInput, ts: TioTimeouts) -> TioInput []
+    todo("termios-nv.tioinput.with_timeouts")
+
+// ── Asking the terminal a question ─────────────────────────────────
+
+// Write a query, wait for its answer, and keep every key that arrived
+// meanwhile.
+//
+// The only correct way to ask a terminal anything while a user is at
+// it.  A program that wrote the query itself and then read until it
+// saw the reply would throw away the keystrokes in between; one that
+// waited forever would hang against every terminal that does not
+// implement the query, which for anything past `CSI 6 n` is most of
+// them.
+//
+// `None` for the reply is the answer to "does this terminal support
+// it", and there is no other answer: a terminal that does not
+// recognise a query is silent about it.
+//
+// ```novo
+// use tioattrs
+// use tioinput
+// use vtquery
+//
+// fn where_is_the_cursor(r: TioInput, t: TioFd) -> Result<TioAsked, TioError> [io]
+//     tioinput.ask(r, t, AnsiCursorPositionQuery)
+// ```
+pub fn ask(r: TioInput, t: TioFd, q: vtquery.AnsiQuery) -> Result<TioAsked, TioError> [io]
+    todo("termios-nv.tioinput.ask")
+
+// Whether the terminal is one this package can drive at all: a
+// descriptor that is a terminal, and that answers DSR.
+//
+// One round trip with a short deadline.  The honest probe a program
+// runs before it decides to be full-screen, and it is a different
+// question from `tioattrs.is_terminal`: a pty with nothing on the
+// other end is a terminal and answers nothing.
+//
+// ```novo
+// use tioattrs
+// use tioinput
+//
+// fn alive(r: TioInput, t: TioFd) -> Bool [io]
+//     tioinput.terminal_answers(r, t)
+// ```
+pub fn terminal_answers(r: TioInput, t: TioFd) -> Bool [io]
+    todo("termios-nv.tioinput.terminal_answers")
