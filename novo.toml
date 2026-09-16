@@ -1,6 +1,6 @@
 [package]
 name        = "termios-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Raw mode and the restore discipline: the terminal's attributes read once as a value and written back, a raw-mode entry the caller cannot forget to undo, the window size by ioctl and by escape-sequence query with SIGWINCH polled rather than handled, the alternate screen and the mouse, bracketed-paste and cursor toggles as one screen state that restores exactly what it set, and the read loop that turns raw bytes into keymap-nv key events with the lone-ESC timeout as a value.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
