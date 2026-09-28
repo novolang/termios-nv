@@ -338,7 +338,7 @@ pub fn size_from_reply(r: vtquery.AnsiReply) -> ?TioWinSize []
 // use seqwrite
 // use tiosize
 //
-// fn ask_for_reports(out: [u8]) -> [u8]
+// fn ask_for_reports(var out: [u8]) -> [u8]
 //     seqwrite.set_mode(out, tiosize.in_band_resize_mode())
 // ```
 pub fn in_band_resize_mode() -> seqwrite.AnsiMode []
