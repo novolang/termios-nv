@@ -1,6 +1,6 @@
 [package]
 name        = "termios-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "Raw mode and the restore discipline: the terminal's attributes read once as a value and written back, a raw-mode entry the caller cannot forget to undo, the window size by ioctl and by escape-sequence query with SIGWINCH polled rather than handled, the alternate screen and the mouse, bracketed-paste and cursor toggles as one screen state that restores exactly what it set, and the read loop that turns raw bytes into keymap-nv key events with the lone-ESC timeout as a value.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -48,11 +48,11 @@ novo        = ">= 0.8.9"
 # BUILDS `CSI ? 1049 h` into a caller's buffer and knows nothing about
 # a file descriptor; this package owns the descriptor and writes it.
 # Nothing here re-spells a sequence ansi-nv already spells.
-ansi-nv = "^0.0.1"
+ansi-nv = "^0.2.2"
 
 # The key and mouse decoder.  `core`, and its one deliberate hole is
 # the hole this package fills: a lone ESC is either the Escape key or
 # the first byte of a sequence, and only the party whose READ TIMED
 # OUT can tell.  keymap-nv holds the bytes and reports `pending`; the
 # reader in `tioinput` is the party with the timeout.
-keymap-nv = "^0.0.1"
+keymap-nv = "^0.2.1"
